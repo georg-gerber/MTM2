@@ -6,6 +6,7 @@ import pydot
 import copy
 
 torch.manual_seed(0)
+#torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
 def sample_BinaryConcrete(alpha0,mlambda):
     #u = torch.ones(alpha0.shape).uniform_(0,1)
@@ -27,11 +28,10 @@ class TreeNode:
         self.mydepth = 0
         self.idx = idx
         self.keep_going_prob = 1.0
-        self.keep_going = 0.0
-        self.keep_going_logistic = 0.0
+        self.keep_going = torch.tensor(0.0)
+        self.keep_going_logistic = torch.tensor(0.0)
 
         self.value = torch.tensor(0.0)
-        self.value_inc = torch.tensor(0.0)
         self.left_point = torch.tensor(0.0)
         self.right_point = torch.tensor(0.0)
         self.split_proportion = torch.tensor(0.0)
@@ -41,6 +41,18 @@ class TreeNode:
             self.is_leaf = True
         else:
             self.is_leaf = False
+
+    def clone_self(self):
+        node = copy.copy(self)
+        node.keep_going = self.keep_going.detach().clone()
+        node.keep_going_logistic = self.keep_going_logistic.detach().clone()
+        node.value = self.value.detach().clone()
+        node.left_point = self.left_point.detach().clone()
+        node.right_point = self.right_point.detach().clone()
+        node.split_proportion = self.split_proportion.detach().clone()
+        node.split_point = self.split_point.detach().clone()
+
+        return node
 
     def left(self):
         return 2*self.idx + 1
@@ -58,11 +70,18 @@ class TreeNode:
 
         delta = self.right_point-self.left_point
         self.split_point = self.split_proportion*delta + self.left_point
+
         nodes[self.left()].left_point = self.left_point
         nodes[self.left()].right_point = self.split_point
 
         nodes[self.right()].right_point = self.right_point
         nodes[self.right()].left_point = self.split_point
+
+    def calc_value_std(self,nodes,mrange,sigma_va,sigma_vb):
+        parentidx = self.parent()
+        midpoint = (self.right_point + self.left_point) / 2.0
+        parent_midpoint = (nodes[parentidx].right_point + nodes[parentidx].left_point) / 2.0
+        return (sigma_va + sigma_vb * torch.abs(parent_midpoint - midpoint) / mrange)
 
     def print_interval(self):
         return "[" + str(self.left_point) + ", " + str(self.right_point) + "]"
@@ -101,25 +120,29 @@ class UnivariateRegressionTree:
         self.nodes = list()
         self.regularizer_function = regularizer_function
         self.data = data
+        self.mrange = interval[1]-interval[0]
 
         # priors for values on tree
         #self.sigma_v0 = 10.0
         self.sigma_v0 = torch.tensor(1000.0)
         self.mu_v0 = torch.tensor(100.0)
         #self.sigma_v = 50
-        self.sigma_v = torch.tensor(100.0)
+        self.sigma_va = torch.tensor(10.0)
+        self.sigma_vb = torch.tensor(500.0)
 
         # set up prior for 'keep going' in tree
         self.mlambda1 = torch.tensor(0.90)
         self.mlambda2 = torch.tensor(0.75)
 
         # lower temp approximates a draw from a Bernoulli
+        self.concrete_temp = 0.001
         #self.concrete_temp = 0.01
-        self.concrete_temp = 0.05
+        #self.concrete_temp = 0.05
 
         # parameter for sharpness of cuts down tree
-        #self.alpha_rho = torch.tensor(1.0)
-        self.alpha_rho = torch.tensor(0.1)
+        self.alpha_rho = torch.tensor(10.0)
+        #self.alpha_rho = torch.tensor(0.5)
+        #self.alpha_rho = torch.tensor(0.1)
 
         # prior for measurement noise (assumed to be estimated from technical replicates)
         self.sigma_data = torch.tensor(10.0)
@@ -156,7 +179,6 @@ class UnivariateRegressionTree:
     def sample_values_from_prior(self):
         # sample initial value
         self.nodes[0].value = torch.distributions.Normal(self.mu_v0,self.sigma_v0).sample()
-        interval_size = self.nodes[0].right_point-self.nodes[0].left_point
 
         # sample keep_going values down the tree
         for i in range(0,self.num_nodes):
@@ -164,11 +186,9 @@ class UnivariateRegressionTree:
 
         # sample values down the tree
         for i in range(1,self.num_nodes):
-            nidx = self.nodes[i].parent()
-            interval_proportion = (self.nodes[i].right_point-self.nodes[i].left_point)/interval_size
-            self.nodes[i].value_inc = torch.distributions.Normal(torch.tensor(0.0),self.sigma_v*(1.0+interval_proportion)).sample()
-            self.nodes[i].value = self.nodes[nidx].value + self.nodes[i].value_inc
-
+            parentidx = self.nodes[i].parent()
+            #interval_proportion = (self.nodes[i].right_point-self.nodes[i].left_point)/self.range
+            self.nodes[i].value = self.nodes[parentidx].value + torch.distributions.Normal(torch.tensor(0.0),self.nodes[i].calc_value_std(self.nodes,self.mrange,self.sigma_va,self.sigma_vb)).sample()
         self.nodes[0].keep_going = torch.tensor(1.0)
 
     def sample_splits_from_prior(self):
@@ -262,7 +282,6 @@ class UnivariateRegressionTree:
             y_fn = self.regularizer_function.eval()
             var_fn = torch.ones(len(self.regularizer_function.inducing_points))*math.pow(self.sigma_data,2.0)/(self.zeta*self.function_reg_constant)
 
-        interval_size = self.nodes[0].right_point - self.nodes[0].left_point
         v_prior_mat = torch.zeros((self.num_nodes,self.num_nodes))
         v_prior_var = torch.zeros(self.num_nodes)
         y_v_prior = torch.zeros(self.num_nodes)
@@ -272,12 +291,12 @@ class UnivariateRegressionTree:
         y_v_prior[0] = self.mu_v0
         # prior on adjacent values
         for i in range(1,self.num_nodes):
-            ## this is wrong - should be difference from parent, not adjacent node!!
-            v_prior_mat[i,i-1] = -1.0
+            parentidx = self.nodes[i].parent()
+            v_prior_mat[i,parentidx] = -1.0
             v_prior_mat[i,i] = 1.0
-            # change offset here to general or revise equation
-            interval_proportion = (self.nodes[i].right_point - self.nodes[i].left_point) / interval_size
-            v_prior_var[i] = math.pow(self.sigma_v * (1.0+interval_proportion),2.0)
+            #interval_proportion = (self.nodes[i].right_point - self.nodes[i].left_point) / interval_size
+            v_prior_var[i] = math.pow(self.nodes[i].calc_value_std(self.nodes,self.mrange,self.sigma_va,self.sigma_vb),2.0)
+            # self.calc_value_std(self,self.nodes,self.mrange,self.sigma_va,self.sigma_vb)
 
         v = torch.zeros(self.num_nodes)
         keep_going = torch.zeros(self.num_nodes)
@@ -316,8 +335,6 @@ class UnivariateRegressionTree:
                 if accept:
                     # update tree
                     self.nodes = new_tree
-                    for i in range(0,self.num_nodes):
-                        new_tree[i] = copy.copy(self.nodes[i])
 
                     # update matrices
                     rho_data = rho_new_data
@@ -339,13 +356,11 @@ class UnivariateRegressionTree:
             if self.nodes[node_idx].is_leaf is False:
                 accept, new_tree, keep_going_new, v_prior_var_new, rho_new_data, q_new_data, rho_new_fn, q_new_fn, X_new = self.sample_split_or_keep_going_posterior('keep_going',node_idx,keep_going,Y_total,v,X,X_total,VAR,VAR_total,v_prior_mat,rho_data,q_data,rho_fn,q_fn)
                 #print(accept)
-                if node_idx == 2:
-                    print(self.nodes[node_idx].keep_going)
+                #if node_idx == 2:
+                #    print(self.nodes[node_idx].keep_going)
                 if accept:
                     # update tree
                     self.nodes = new_tree
-                    for i in range(0,self.num_nodes):
-                        new_tree[i] = copy.copy(self.nodes[i])
 
                     # update matrices
                     rho_data = rho_new_data
@@ -383,7 +398,7 @@ class UnivariateRegressionTree:
         # copy of tree for MCMC moves
         new_tree = list()
         for i in range(0, self.num_nodes):
-            new_tree.append(copy.copy(self.nodes[i]))
+            new_tree.append(self.nodes[i].clone_self())
 
         keep_going_new = keep_going.detach().clone()
         node = new_tree[node_idx]
@@ -407,7 +422,7 @@ class UnivariateRegressionTree:
 
         # calculate intervals
         for i in range(0, self.num_nodes):
-            new_tree[i].calc_child_intervals(self.nodes)
+            new_tree[i].calc_child_intervals(new_tree)
 
         # copy of rho & q for MCMC moves
         rho_new_data = None
@@ -426,9 +441,7 @@ class UnivariateRegressionTree:
         interval_size = self.nodes[0].right_point - self.nodes[0].left_point
         v_prior_var_new[0] = math.pow(self.sigma_v0, 2.0)
         for i in range(1,self.num_nodes):
-            # change offset here to general or revise equation
-            interval_proportion = (new_tree[i].right_point - new_tree[i].left_point) / interval_size
-            v_prior_var_new[i] = math.pow(self.sigma_v * (1.0+interval_proportion),2.0)
+            v_prior_var_new[i] = math.pow(self.nodes[i].calc_value_std(self.nodes, self.mrange, self.sigma_va, self.sigma_vb),2.0)
 
         # calculate probabilities down the tree
         for i in range(0, self.num_nodes):
@@ -484,9 +497,9 @@ class UnivariateRegressionTree:
 
         ll_old = old_log_prob + log_prob_prop_new_given_old + old_log_prior_prob
 
-        if node_idx == 2 and sample_type == 'keep_going':
-            print("new_log_prob=",new_log_prob)
-            print("old_log_prob=",old_log_prob)
+        #if node_idx == 2 and sample_type == 'keep_going':
+        #    print("new_log_prob=",new_log_prob)
+        #    print("old_log_prob=",old_log_prob)
 
         u = torch.log(torch.rand(1))
         #print("Accept prob. = ",torch.exp(ll_new-ll_old))
@@ -513,7 +526,9 @@ v = tree.eval_tree(x)
 fig, ax = plt.subplots()
 #ax.plot(x,v)
 
-for i in range(0,1000):
+for i in range(0,500):
+    if i % 20 == 0:
+        print(i)
     tree.sample_posterior(1)
     v2 = tree.eval_tree(x)
     ax.plot(x,v2)
